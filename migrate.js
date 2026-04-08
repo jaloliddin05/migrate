@@ -1,34 +1,21 @@
 /**
- * Migration script: Express/Knex (old DB) → NestJS/Prisma (new DB)
+ * PARTIAL Migration script: Express/Knex (old DB) → NestJS/Prisma (new DB)
+ * Faqat 2026-yil 7-aprel 00:00 (UTC) dan hozirgacha bo'lgan datalar.
  *
  * Ishlatish:
- *   .env faylga quyidagi o'zgaruvchilarni qo'shing, keyin:
- *   node migrate.js
- *
- * .env da kerakli o'zgaruvchilar:
- *   OLD_DB_URL=postgres://...
- *   NEW_DB_URL=postgres://...
- *   AWS_ACCESS_KEY_ID=...
- *   AWS_SECRET_ACCESS_KEY=...
- *   AWS_REGION=...
- *   S3_BUCKET_NAME=...
- *   R2_ACCESS_KEY_ID=...
- *   R2_SECRET_ACCESS_KEY=...
- *   R2_ACCOUNT_ID=...
- *   R2_BUCKET_NAME=...
- *   R2_PUBLIC_DOMAIN=https://pub-xxx.r2.dev   (yoki custom domain, oxirida / yo'q)
+ *   node migrate-partial.js
  *
  * Tartib:
- *   1.  users        → user
- *   2.  levels       → group_level
- *   3.  teachers     → mentor
- *   4.  admins       → administration
- *   5.  groups       → group
- *   6.  students     → student (access_expires_at = payments oxirgi end_date)
- *   7.  attendance   → attendance (mentor_id yo'q bo'lsa skip)
- *   8.  assignments  → assignment + file (S3→R2 copy)
- *   9.  submissions  → assignment_submission + file (S3→R2 copy)
- *  10.  student_group_history → group_student
+ *   1.  users (mapping uchun hammasi o'qiladi, faqat yangilari insert)
+ *   2.  levels (mapping uchun hammasi o'qiladi, faqat yangilari insert)
+ *   3.  teachers → mentor (mapping uchun hammasi o'qiladi, faqat yangilari insert)
+ *   4.  admins → administration (yangilari)
+ *   5.  groups → group (yangilari: created_at >= filter)
+ *   6.  students → student (yangilari: created_at >= filter)
+ *   7.  attendance → attendance (yangilari: class_date >= filter)
+ *   8.  assignments → assignment + file (yangilari: created_at >= filter)
+ *   9.  submissions → assignment_submission + file (yangilari: submitted_at >= filter)
+ *  10.  student_group_history → group_student (yangilari: joined_at >= filter)
  */
 
 require('dotenv').config();
@@ -40,6 +27,10 @@ const { S3Client,
         PutObjectCommand,
         HeadObjectCommand } = require('@aws-sdk/client-s3');
 const path                 = require('path');
+
+// ─── Sana filter ──────────────────────────────────────────────────────────────
+const MIGRATION_FROM = new Date('2026-04-07T00:00:00.000Z');
+console.log(`📅  Filter: ${MIGRATION_FROM.toISOString()} dan hozirgacha\n`);
 
 // ─── S3 client (eski — AWS) ───────────────────────────────────────────────────
 const s3 = new S3Client({
@@ -68,31 +59,25 @@ const oldDb = new Client({ connectionString: process.env.OLD_DB_URL });
 const newDb = new Client({ connectionString: process.env.NEW_DB_URL });
 
 // ─── ID mapping tables (old integer id → new uuid) ───────────────────────────
-const userMap       = new Map(); // old users.id      → new user.id (uuid)
-const levelMap      = new Map(); // old levels.id     → new group_level.id (uuid)
-const groupMap      = new Map(); // old groups.id     → new group.id (uuid)
-const assignmentMap = new Map(); // old assignments.id → new assignment.id (uuid)
-const studentMap    = new Map(); // old students.user_id → new student.id (uuid)
+// Eslatma: mapping tablalar BARCHA (eski + yangi) ma'lumotlarni o'z ichiga oladi,
+// chunki yangi entities ularga FK orqali bog'liq bo'lishi mumkin.
+const userMap       = new Map();
+const levelMap      = new Map();
+const groupMap      = new Map();
+const assignmentMap = new Map();
+const studentMap    = new Map();
 
 // ─── File helpers: S3 → R2 copy ──────────────────────────────────────────────
 
-/**
- * S3 dagi faylni R2 ga ko'chiradi.
- * @param {string} s3Key  — eski path, masalan "assignments/images/xxx.jpg"
- * @returns {{ fileId, r2Key, r2Url, filename, mimetype, size } | null}
- */
 async function copyFileToR2(s3Key) {
   if (!s3Key) return null;
 
-  // URL decode (path da %20 kabi escaped char bo'lishi mumkin)
   const decodedKey = decodeURIComponent(s3Key);
 
   try {
-    // 1. S3 dan stream sifatida yuklab olish
     const getCmd = new GetObjectCommand({ Bucket: S3_BUCKET, Key: decodedKey });
     const s3Res  = await s3.send(getCmd);
 
-    // Stream → Buffer
     const chunks = [];
     for await (const chunk of s3Res.Body) chunks.push(chunk);
     const body = Buffer.concat(chunks);
@@ -101,7 +86,6 @@ async function copyFileToR2(s3Key) {
     const fileSize    = body.length;
     const filename    = path.basename(decodedKey);
 
-    // 2. R2 ga yuklash (key ni aynan saqlaymiz, structure o'zgarmasin)
     const putCmd = new PutObjectCommand({
       Bucket:      R2_BUCKET,
       Key:         decodedKey,
@@ -110,19 +94,10 @@ async function copyFileToR2(s3Key) {
     });
     await r2.send(putCmd);
 
-    // 3. Public URL
     const r2Url = `${R2_PUBLIC_DOMAIN}/${decodedKey}`;
 
-    return {
-      fileId:   uuidv4(),
-      r2Key:    decodedKey,
-      r2Url,
-      filename,
-      mimetype: contentType,
-      size:     fileSize,
-    };
+    return { fileId: uuidv4(), r2Key: decodedKey, r2Url, filename, mimetype: contentType, size: fileSize };
   } catch (err) {
-    // Fayl S3 da topilmasa yoki boshqa xato — skip
     if (err.name === 'NoSuchKey' || err.$metadata?.httpStatusCode === 404) {
       console.warn(`\n     ⚠ S3 da topilmadi, skip: ${decodedKey}`);
     } else {
@@ -132,9 +107,6 @@ async function copyFileToR2(s3Key) {
   }
 }
 
-/**
- * R2 da fayl allaqachon borligini tekshiradi (ikkinchi ishlatganda re-upload qilmasin).
- */
 async function existsInR2(key) {
   try {
     await r2.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: key }));
@@ -144,15 +116,12 @@ async function existsInR2(key) {
   }
 }
 
-/**
- * Fayl kengaytmasiga qarab MIME type taxmin qiladi.
- */
 function guessMime(filename) {
   const ext = path.extname(filename).toLowerCase();
   const map = {
     '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
     '.png': 'image/png',  '.gif': 'image/gif',
-    '.webp': 'image/webp','.pdf': 'application/pdf',
+    '.webp': 'image/webp', '.pdf': 'application/pdf',
     '.doc': 'application/msword',
     '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     '.odt': 'application/vnd.oasis.opendocument.text',
@@ -166,10 +135,6 @@ function guessMime(filename) {
   return map[ext] || 'application/octet-stream';
 }
 
-/**
- * file table ga yozadi va file.id ni qaytaradi.
- * Agar fayl allaqachon R2 da bo'lsa, re-upload qilmaydi.
- */
 async function insertFileRecord({ fileId, r2Key, r2Url, filename, mimetype, size }) {
   await newDb.query(`
     INSERT INTO "file" (
@@ -177,23 +142,9 @@ async function insertFileRecord({ fileId, r2Key, r2Url, filename, mimetype, size
       bucket, is_active, created_at, updated_at
     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
     ON CONFLICT (key) DO NOTHING
-  `, [
-    fileId,
-    r2Key,
-    r2Url,
-    filename,
-    mimetype,
-    size,
-    R2_BUCKET,
-    true,
-    new Date(),
-    new Date(),
-  ]);
+  `, [fileId, r2Key, r2Url, filename, mimetype, size, R2_BUCKET, true, new Date(), new Date()]);
 
-  // Agar conflict bo'lgan bo'lsa, mavjud id ni olamiz
-  const { rows } = await newDb.query(
-    `SELECT id FROM "file" WHERE key = $1`, [r2Key]
-  );
+  const { rows } = await newDb.query(`SELECT id FROM "file" WHERE key = $1`, [r2Key]);
   return rows[0]?.id || fileId;
 }
 
@@ -209,12 +160,10 @@ function splitFullName(fullName) {
 }
 
 function mapRole(oldRole) {
-  // 1-project roles: Teacher, Student, Admin (va kichik harfli variantlari)
   const r = (oldRole || '').toLowerCase();
-  if (r === 'teacher')  return 'mentor';
-  if (r === 'admin')    return 'admin';
-  if (r === 'student')  return 'student';
-  // Fallback
+  if (r === 'teacher') return 'mentor';
+  if (r === 'admin')   return 'admin';
+  if (r === 'student') return 'student';
   return 'student';
 }
 
@@ -224,14 +173,7 @@ function mapGroupStatus(isActive) {
 
 function mapStudentStatus(oldStatus) {
   const s = (oldStatus || '').toLowerCase().replace(/^'|'$/g, '');
-  const map = {
-    new:      'new',
-    active:   'active',
-    inactive: 'expired',
-    blocked:  'blocked',
-    frozen:   'frozen',
-    dropped:  'dropped',
-  };
+  const map = { new: 'new', active: 'active', inactive: 'expired', blocked: 'blocked', frozen: 'frozen', dropped: 'dropped' };
   return map[s] || 'new';
 }
 
@@ -247,13 +189,43 @@ async function run(label, fn) {
   }
 }
 
+// ─── Helper: old teacher user_id → new mentor.id ─────────────────────────────
+async function getMentorIdByOldUserId(oldUserId) {
+  const newUserId = userMap.get(oldUserId);
+  if (!newUserId) return null;
+  const { rows } = await newDb.query(`SELECT id FROM "mentor" WHERE user_id = $1`, [newUserId]);
+  return rows[0]?.id || null;
+}
+
 // ─── Migration steps ──────────────────────────────────────────────────────────
 
-// 1. users → user
+/**
+ * 1. users → user
+ *
+ * Mapping uchun BARCHA userlar o'qiladi (eski ham).
+ * Lekin yangi DB ga faqat created_at >= MIGRATION_FROM bo'lganlar insert qilinadi.
+ * (Eski userlar oldingi full migration da allaqachon bor deb faraz qilinadi.)
+ */
 async function migrateUsers() {
-  const { rows } = await oldDb.query(`
-    SELECT * FROM users WHERE deleted_at IS NULL ORDER BY id
+  // Mapping uchun barchasini o'qiymiz (FK bog'lanishlar uchun kerak)
+  const { rows: allUsers } = await oldDb.query(`
+    SELECT id FROM users WHERE deleted_at IS NULL ORDER BY id
   `);
+
+  // Yangi DB dagi mavjud user'larning old_id <-> new_id mapping ini tiklash
+  // (Avvalgi migratsiyada yaratilganlar uchun — lekin biz bu scriptda ularni skip qilamiz)
+  // Shuning uchun faqat yangilarini insert qilamiz, mapping ni esa DB dan o'qimaymiz.
+  // Eslatma: Agar oldingi full migration bo'lgan bo'lsa, mapping ni tiklash uchun
+  // phone_number yoki email orqali match qilish kerak bo'ladi.
+  // Bu script faqat birinchi marta ishlatiladi deb faraz qiladi (yoki test uchun).
+
+  // Faqat yangi yaratilganlarni insert qilamiz
+  const { rows } = await oldDb.query(`
+    SELECT * FROM users
+    WHERE deleted_at IS NULL
+      AND created_at >= $1
+    ORDER BY id
+  `, [MIGRATION_FROM]);
 
   let count = 0;
   for (const u of rows) {
@@ -285,40 +257,78 @@ async function migrateUsers() {
     ]);
     count++;
   }
+
+  // Mapping ni to'ldirish: yangi DB da allaqachon bor userlar uchun ham
+  // phone_number orqali match qilamiz (FK lar to'g'ri ishlashi uchun)
+  const { rows: oldAllRows } = await oldDb.query(`
+    SELECT id, phone_number FROM users WHERE deleted_at IS NULL ORDER BY id
+  `);
+  for (const ou of oldAllRows) {
+    if (userMap.has(ou.id)) continue; // Allaqachon set qilingan
+    const { rows: matched } = await newDb.query(
+      `SELECT id FROM "user" WHERE phone = $1 LIMIT 1`, [ou.phone_number]
+    );
+    if (matched[0]) userMap.set(ou.id, matched[0].id);
+  }
+
   return count;
 }
 
-// 2. levels → group_level
+/**
+ * 2. levels → group_level
+ *
+ * Levellar odatda kam o'zgaradi. Mapping uchun barchasini o'qiymiz,
+ * yangilari insert qilinadi.
+ */
 async function migrateLevels() {
   const { rows } = await oldDb.query(`SELECT * FROM levels ORDER BY id`);
 
   let count = 0;
   for (const l of rows) {
-    const newId = uuidv4();
-    levelMap.set(l.id, newId);
+    // DB da mavjudligini tekshiramiz (name orqali)
+    const { rows: existing } = await newDb.query(
+      `SELECT id FROM "group_level" WHERE level = $1 LIMIT 1`, [l.name]
+    );
 
-    await newDb.query(`
-      INSERT INTO "group_level" (id, level, created_at)
-      VALUES ($1, $2, $3)
-      ON CONFLICT (id) DO NOTHING
-    `, [newId, l.name, new Date()]);
-    count++;
+    if (existing[0]) {
+      // Mavjud — faqat mapping ga qo'shamiz
+      levelMap.set(l.id, existing[0].id);
+    } else {
+      // Yangi — insert qilamiz
+      const newId = uuidv4();
+      levelMap.set(l.id, newId);
+      await newDb.query(`
+        INSERT INTO "group_level" (id, level, created_at)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (id) DO NOTHING
+      `, [newId, l.name, new Date()]);
+      count++;
+    }
   }
   return count;
 }
 
-// 3. teachers → mentor
-// users jadvali allaqachon migrate qilingan, shuning uchun faqat mentor record yaratamiz
+/**
+ * 3. teachers → mentor
+ *
+ * Yangi userlar bilan birga kelgan teacherlar insert qilinadi.
+ * Mapping uchun eski teacherlar ham DB dan o'qiladi.
+ */
 async function migrateMentors() {
   const { rows } = await oldDb.query(`SELECT * FROM teachers ORDER BY user_id`);
 
   let count = 0;
   for (const t of rows) {
     const userId = userMap.get(t.user_id);
-    if (!userId) continue; // agar user migrate bo'lmagan bo'lsa (masalan, deleted_at bor)
+    if (!userId) continue;
+
+    // DB da mavjudligini tekshiramiz
+    const { rows: existing } = await newDb.query(
+      `SELECT id FROM "mentor" WHERE user_id = $1 LIMIT 1`, [userId]
+    );
+    if (existing[0]) continue; // Allaqachon bor — skip
 
     const mentorId = uuidv4();
-
     await newDb.query(`
       INSERT INTO "mentor" (id, user_id)
       VALUES ($1, $2)
@@ -329,7 +339,11 @@ async function migrateMentors() {
   return count;
 }
 
-// 4. admins → administration
+/**
+ * 4. admins → administration
+ *
+ * Yangi adminlar insert qilinadi.
+ */
 async function migrateAdmins() {
   const { rows } = await oldDb.query(`SELECT * FROM admins ORDER BY user_id`);
 
@@ -337,6 +351,11 @@ async function migrateAdmins() {
   for (const a of rows) {
     const userId = userMap.get(a.user_id);
     if (!userId) continue;
+
+    const { rows: existing } = await newDb.query(
+      `SELECT id FROM "administration" WHERE user_id = $1 LIMIT 1`, [userId]
+    );
+    if (existing[0]) continue; // Allaqachon bor — skip
 
     await newDb.query(`
       INSERT INTO "administration" (id, user_id)
@@ -348,20 +367,37 @@ async function migrateAdmins() {
   return count;
 }
 
-// 5. groups → group
+/**
+ * 5. groups → group
+ *
+ * Faqat created_at >= MIGRATION_FROM bo'lgan grouplar.
+ * Eski grouplar mapping uchun DB dan o'qiladi.
+ */
 async function migrateGroups() {
-  const { rows } = await oldDb.query(`SELECT * FROM groups ORDER BY id`);
+  // Eski DB dagi barcha grouplar uchun mapping ni tiklash (name orqali)
+  const { rows: allOldGroups } = await oldDb.query(`SELECT id, name FROM groups ORDER BY id`);
+  for (const g of allOldGroups) {
+    const { rows: existing } = await newDb.query(
+      `SELECT id FROM "group" WHERE name = $1 LIMIT 1`, [g.name]
+    );
+    if (existing[0]) groupMap.set(g.id, existing[0].id);
+  }
+
+  // Yangi grouplarni insert qilamiz
+  const { rows } = await oldDb.query(`
+    SELECT * FROM groups
+    WHERE created_at >= $1
+    ORDER BY id
+  `, [MIGRATION_FROM]);
 
   let count = 0;
   for (const g of rows) {
-    const newId    = uuidv4();
-    const levelId  = g.level_id  ? levelMap.get(g.level_id)  : null;
-    const mentorId = g.main_teacher_id
-      ? await getMentorIdByOldUserId(g.main_teacher_id)
-      : null;
-    const assistantId = g.assistant_teacher_id
-      ? await getMentorIdByOldUserId(g.assistant_teacher_id)
-      : null;
+    if (groupMap.has(g.id)) continue; // Allaqachon mapping da bor — skip
+
+    const newId       = uuidv4();
+    const levelId     = g.level_id ? levelMap.get(g.level_id) : null;
+    const mentorId    = g.main_teacher_id       ? await getMentorIdByOldUserId(g.main_teacher_id)       : null;
+    const assistantId = g.assistant_teacher_id  ? await getMentorIdByOldUserId(g.assistant_teacher_id)  : null;
 
     groupMap.set(g.id, newId);
 
@@ -386,12 +422,33 @@ async function migrateGroups() {
   return count;
 }
 
-// 6. students → student
-// access_expires_at = payments jadvalidagi eng oxirgi end_date
+/**
+ * 6. students → student
+ *
+ * Faqat created_at >= MIGRATION_FROM bo'lgan studentlar.
+ * Eski studentlar mapping uchun DB dan o'qiladi.
+ */
 async function migrateStudents() {
-  const { rows } = await oldDb.query(`SELECT * FROM students ORDER BY user_id`);
+  // Mapping tiklash: eski studentlar uchun (phone orqali user match)
+  const { rows: allOldStudents } = await oldDb.query(
+    `SELECT s.user_id, u.phone_number FROM students s JOIN users u ON s.user_id = u.id ORDER BY s.user_id`
+  );
+  for (const s of allOldStudents) {
+    const { rows: existing } = await newDb.query(
+      `SELECT st.id FROM student st JOIN "user" u ON st.user_id = u.id WHERE u.phone = $1 LIMIT 1`,
+      [s.phone_number]
+    );
+    if (existing[0]) studentMap.set(s.user_id, existing[0].id);
+  }
 
-  // Har bir student uchun oxirgi payment end_date ni olish
+  // Yangi studentlarni insert qilamiz
+  const { rows } = await oldDb.query(`
+    SELECT * FROM students
+    WHERE created_at >= $1
+    ORDER BY user_id
+  `, [MIGRATION_FROM]);
+
+  // Payment end_date
   const { rows: payRows } = await oldDb.query(`
     SELECT DISTINCT ON (student_id) student_id, end_date
     FROM payments
@@ -401,42 +458,46 @@ async function migrateStudents() {
 
   let count = 0;
   for (const s of rows) {
-    const userId  = userMap.get(s.user_id);
+    const userId = userMap.get(s.user_id);
     if (!userId) continue;
 
-    const studentId = uuidv4();
+    if (studentMap.has(s.user_id)) continue; // Allaqachon bor — skip
+
+    const studentId   = uuidv4();
     studentMap.set(s.user_id, studentId);
 
-    const groupId     = s.current_group_id ? groupMap.get(s.current_group_id) : null;
-    const expiresAt   = payMap.get(s.user_id) || null;
-    const status      = mapStudentStatus(s.status);
+    const groupId   = s.current_group_id ? groupMap.get(s.current_group_id) : null;
+    const expiresAt = payMap.get(s.user_id) || null;
+    const status    = mapStudentStatus(s.status);
 
     await newDb.query(`
       INSERT INTO "student" (
         id, user_id, status, group_id, access_expires_at
       ) VALUES ($1,$2,$3,$4,$5)
       ON CONFLICT (user_id) DO NOTHING
-    `, [
-      studentId,
-      userId,
-      status,
-      groupId,
-      expiresAt,
-    ]);
+    `, [studentId, userId, status, groupId, expiresAt]);
     count++;
   }
   return count;
 }
 
-// 7. attendance → attendance  (mentor_id yo'q bo'lsa skip)
+/**
+ * 7. attendance → attendance
+ *
+ * Faqat class_date >= MIGRATION_FROM bo'lgan yozuvlar.
+ */
 async function migrateAttendance() {
-  const { rows } = await oldDb.query(`SELECT * FROM attendance ORDER BY id`);
+  const { rows } = await oldDb.query(`
+    SELECT * FROM attendance
+    WHERE class_date >= $1
+    ORDER BY id
+  `, [MIGRATION_FROM]);
 
   let count   = 0;
   let skipped = 0;
   for (const a of rows) {
     const studentId = studentMap.get(a.student_id);
-    const groupId   = a.group_id   ? groupMap.get(a.group_id) : null;
+    const groupId   = a.group_id ? groupMap.get(a.group_id) : null;
     const mentorId  = a.marked_by_teacher_id
       ? await getMentorIdByOldUserId(a.marked_by_teacher_id)
       : null;
@@ -449,29 +510,27 @@ async function migrateAttendance() {
         student_id, group_id, mentor_id
       ) VALUES ($1,$2,$3,$4,$5,$6,$7)
       ON CONFLICT (student_id, group_id, date) DO NOTHING
-    `, [
-      uuidv4(),
-      new Date(),
-      a.class_date,
-      a.is_present ?? false,
-      studentId,
-      groupId,
-      mentorId,
-    ]);
+    `, [uuidv4(), new Date(), a.class_date, a.is_present ?? false, studentId, groupId, mentorId]);
     count++;
   }
-  if (skipped > 0) console.log(`\n     (${skipped} attendance skipped — mentor_id yoki boshqa FK topilmadi)`);
+  if (skipped > 0) console.log(`\n     (${skipped} attendance skipped — mentor_id yoki FK topilmadi)`);
   return count;
 }
 
-// 8. assignments → assignment + file (S3→R2)
-// Har bir assignment da image_url va file_url bo'lishi mumkin
-// Ikkalasi ham file table ga yoziladi, assignment.files[] relation orqali bog'lanadi
+/**
+ * 8. assignments → assignment + file (S3→R2)
+ *
+ * Faqat created_at >= MIGRATION_FROM bo'lgan topshiriqlar.
+ */
 async function migrateAssignments() {
-  const { rows } = await oldDb.query(`SELECT * FROM assignments ORDER BY id`);
+  const { rows } = await oldDb.query(`
+    SELECT * FROM assignments
+    WHERE created_at >= $1
+    ORDER BY id
+  `, [MIGRATION_FROM]);
 
-  let count      = 0;
-  let skipped    = 0;
+  let count       = 0;
+  let skipped     = 0;
   let filesCopied = 0;
 
   for (const a of rows) {
@@ -494,37 +553,23 @@ async function migrateAssignments() {
         group_id, mentor_id
       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
       ON CONFLICT (id) DO NOTHING
-    `, [
-      newId,
-      a.title,
-      a.content,
-      a.due_date || new Date(),
-      10,
-      'active',
-      a.created_at,
-      groupId,
-      mentorId,
-    ]);
+    `, [newId, a.title, a.content, a.due_date || new Date(), 10, 'active', a.created_at, groupId, mentorId]);
 
-    // image_url va file_url — ikkalasini ham S3→R2 ga ko'chirib file table ga bog'laymiz
     for (const s3Key of [a.image_url, a.file_url]) {
       if (!s3Key) continue;
 
-      const decodedKey = decodeURIComponent(s3Key);
-      const alreadyInR2 = await existsInR2(decodedKey);
+      const decodedKey   = decodeURIComponent(s3Key);
+      const alreadyInR2  = await existsInR2(decodedKey);
 
       let fileInfo;
       if (alreadyInR2) {
-        // R2 da bor — faqat DB ga yoz
-        const r2Url   = `${R2_PUBLIC_DOMAIN}/${decodedKey}`;
-        const filename = path.basename(decodedKey);
         fileInfo = {
           fileId:   uuidv4(),
           r2Key:    decodedKey,
-          r2Url,
-          filename,
-          mimetype: guessMime(decodedKey),
-          size:     0,
+          r2Url:    `${R2_PUBLIC_DOMAIN}/${decodedKey}`,
+          filename:  path.basename(decodedKey),
+          mimetype:  guessMime(decodedKey),
+          size:      0,
         };
       } else {
         fileInfo = await copyFileToR2(s3Key);
@@ -533,29 +578,32 @@ async function migrateAssignments() {
       if (!fileInfo) continue;
 
       const fileId = await insertFileRecord(fileInfo);
-
-      // assignment ↔ file bog'lanish (file.assignment_id)
-      await newDb.query(
-        `UPDATE "file" SET assignment_id = $1 WHERE id = $2`,
-        [newId, fileId]
-      );
+      await newDb.query(`UPDATE "file" SET assignment_id = $1 WHERE id = $2`, [newId, fileId]);
       filesCopied++;
     }
 
     count++;
   }
 
-  if (skipped    > 0) console.log(`\n     (${skipped} assignment skipped — group yoki mentor topilmadi)`);
+  if (skipped     > 0) console.log(`\n     (${skipped} assignment skipped — group yoki mentor topilmadi)`);
   if (filesCopied > 0) console.log(`\n     (${filesCopied} fayl S3→R2 ga ko'chirildi)`);
   return count;
 }
 
-// 9. submissions → assignment_submission + file (S3→R2)
+/**
+ * 9. submissions → assignment_submission + file (S3→R2)
+ *
+ * Faqat submitted_at >= MIGRATION_FROM bo'lgan topshirmalar.
+ */
 async function migrateSubmissions() {
-  const { rows } = await oldDb.query(`SELECT * FROM submissions ORDER BY id`);
+  const { rows } = await oldDb.query(`
+    SELECT * FROM submissions
+    WHERE submitted_at >= $1
+    ORDER BY id
+  `, [MIGRATION_FROM]);
 
-  let count      = 0;
-  let skipped    = 0;
+  let count       = 0;
+  let skipped     = 0;
   let filesCopied = 0;
 
   for (const s of rows) {
@@ -581,7 +629,7 @@ async function migrateSubmissions() {
       assignmentId,
       studentId,
       s.submission_content,
-      s.submission_file_url,   // fallback: to'g'ridan-to'g'ri path (file record bo'lmasa)
+      s.submission_file_url,
       score,
       percentage,
       s.teacher_feedback,
@@ -589,7 +637,6 @@ async function migrateSubmissions() {
       s.graded_by_teacher_id ? new Date() : null,
     ]);
 
-    // submission_file_url va submission_image_url — ikkalasini S3→R2 ga ko'chiramiz
     for (const s3Key of [s.submission_file_url, s.submission_image_url]) {
       if (!s3Key) continue;
 
@@ -598,15 +645,13 @@ async function migrateSubmissions() {
 
       let fileInfo;
       if (alreadyInR2) {
-        const r2Url   = `${R2_PUBLIC_DOMAIN}/${decodedKey}`;
-        const filename = path.basename(decodedKey);
         fileInfo = {
           fileId:   uuidv4(),
           r2Key:    decodedKey,
-          r2Url,
-          filename,
-          mimetype: guessMime(decodedKey),
-          size:     0,
+          r2Url:    `${R2_PUBLIC_DOMAIN}/${decodedKey}`,
+          filename:  path.basename(decodedKey),
+          mimetype:  guessMime(decodedKey),
+          size:      0,
         };
       } else {
         fileInfo = await copyFileToR2(s3Key);
@@ -615,8 +660,6 @@ async function migrateSubmissions() {
       if (!fileInfo) continue;
 
       const fileId = await insertFileRecord(fileInfo);
-
-      // assignment_submission ↔ file bog'lanish
       await newDb.query(
         `UPDATE "file" SET assignment_submission_id = $1 WHERE id = $2`,
         [submissionId, fileId]
@@ -632,11 +675,17 @@ async function migrateSubmissions() {
   return count;
 }
 
-// 10. student_group_history → group_student
+/**
+ * 10. student_group_history → group_student
+ *
+ * Faqat joined_at >= MIGRATION_FROM bo'lgan yozuvlar.
+ */
 async function migrateGroupStudents() {
   const { rows } = await oldDb.query(`
-    SELECT * FROM student_group_history ORDER BY joined_at
-  `);
+    SELECT * FROM student_group_history
+    WHERE joined_at >= $1
+    ORDER BY joined_at
+  `, [MIGRATION_FROM]);
 
   let count   = 0;
   let skipped = 0;
@@ -646,7 +695,6 @@ async function migrateGroupStudents() {
 
     if (!studentId || !groupId) { skipped++; continue; }
 
-    // Groupning mentor va assistant idlarini olamiz
     const { rows: gRows } = await newDb.query(
       `SELECT mentor_id, assistant_id FROM "group" WHERE id = $1`, [groupId]
     );
@@ -674,16 +722,6 @@ async function migrateGroupStudents() {
   return count;
 }
 
-// ─── Helper: old teacher user_id → new mentor.id ─────────────────────────────
-async function getMentorIdByOldUserId(oldUserId) {
-  const newUserId = userMap.get(oldUserId);
-  if (!newUserId) return null;
-  const { rows } = await newDb.query(
-    `SELECT id FROM "mentor" WHERE user_id = $1`, [newUserId]
-  );
-  return rows[0]?.id || null;
-}
-
 // ─── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
   const required = [
@@ -696,7 +734,6 @@ async function main() {
   if (missing.length) {
     console.error('❌  Quyidagi environment variablelar topilmadi:');
     missing.forEach(k => console.error(`     - ${k}`));
-    console.error('\n   .env faylga qo\'shing va qayta ishga tushiring.');
     process.exit(1);
   }
 
@@ -705,20 +742,20 @@ async function main() {
   await newDb.connect();
   console.log('✓  Ulanish muvaffaqiyatli\n');
 
-  console.log('🚀  Migratsiya boshlanmoqda...\n');
+  console.log('🚀  Qisman migratsiya boshlanmoqda...\n');
 
-  await run('1. users        → user',              migrateUsers);
-  await run('2. levels       → group_level',        migrateLevels);
-  await run('3. teachers     → mentor',             migrateMentors);
-  await run('4. admins       → administration',     migrateAdmins);
-  await run('5. groups       → group',              migrateGroups);
-  await run('6. students     → student',            migrateStudents);
-  await run('7. attendance   → attendance',         migrateAttendance);
-  await run('8. assignments  → assignment',         migrateAssignments);
-  await run('9. submissions  → assignment_submission', migrateSubmissions);
-  await run('10. student_group_history → group_student', migrateGroupStudents);
+  await run('1. users (yangilari)           → user',              migrateUsers);
+  await run('2. levels (mapping + yangilari) → group_level',      migrateLevels);
+  await run('3. teachers (yangilari)         → mentor',           migrateMentors);
+  await run('4. admins (yangilari)           → administration',   migrateAdmins);
+  await run('5. groups (yangilari)           → group',            migrateGroups);
+  await run('6. students (yangilari)         → student',          migrateStudents);
+  await run('7. attendance (7-apreldan)      → attendance',       migrateAttendance);
+  await run('8. assignments (7-apreldan)     → assignment',       migrateAssignments);
+  await run('9. submissions (7-apreldan)     → assignment_submission', migrateSubmissions);
+  await run('10. group_history (7-apreldan)  → group_student',   migrateGroupStudents);
 
-  console.log('\n✅  Migratsiya yakunlandi!');
+  console.log('\n✅  Qisman migratsiya yakunlandi!');
 }
 
 main()
